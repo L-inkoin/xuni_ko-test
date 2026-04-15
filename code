@@ -1,0 +1,147 @@
+install.packages("scTenifoldKnk")
+library(scTenifoldKnk)
+library(Seurat)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(hdf5r)
+
+# 数据读取
+h5_files <- list.files(path = "F:/xuni/data", pattern = "\\.h5$", full.names = TRUE)
+sample_names <- gsub("_raw_feature_bc_matrix\\.h5$", "", basename(h5_files))
+sc_list <- list()
+for(i in seq_along(h5_files)){
+  data <- Read10X_h5(h5_files[i])
+  obj <- CreateSeuratObject(counts = data, 
+                            project = sample_names[i], 
+                            min.cells = 3, 
+                            min.features = 200)
+  sc_list[[i]] <- obj
+}
+pbmc <- merge(sc_list[[1]], y = sc_list[-1], add.cell.ids = sample_names)
+pbmc$Type <- ifelse(grepl("HT", pbmc$orig.ident), "Tumor", "Normal")
+seurat_obj <- subset(pbmc, subset = Type == "Tumor")
+seurat_obj <- JoinLayers(seurat_obj) 
+
+# 提取表达矩阵
+count_matrix <- GetAssayData(seurat_obj, layer = "counts")
+# 定义要敲除的基因
+target_genes <- c("SPP1", "AKR1C3", "MMP9", "CDK4", "LGALS1")
+comb_name <- "Combined_5_Genes"
+
+seurat_obj <- FindVariableFeatures(object=seurat_obj, selection.method="vst", nfeatures=2000)
+high_variable_genes <- VariableFeatures(seurat_obj)
+# 创建输出目录
+if(!dir.exists("scTenifoldKnk_Results")) dir.create("scTenifoldKnk_Results")
+# 多基因敲除方案：逐个敲除并整合结果
+all_diff_reg <- list()
+for(gene in target_genes) {
+  cat("Processing knockout for:", gene, "\n")
+  count_matrix_mod <- count_matrix
+  count_matrix_mod[gene, ] <- 0
+  genes_to_keep <- unique(c(gene, high_variable_genes))
+  input_data <- as.matrix(count_matrix_mod[genes_to_keep, ])
+  tryCatch({
+    ko_res <- scTenifoldKnk(countMatrix = input_data,
+                            gKO = gene,      #需要敲除的基因
+                            qc = TRUE,                #是否进行QC
+                            qc_mtThreshold = 0.1,        #mt的阈值
+                            qc_minLSize = 1000,         #文库阈值(细胞测到的基因总数)
+                            nc_nNet = 10,              #子网络数量
+                            nc_nCells = 500            #每个网络中随机抽取的细胞数
+    )
+
+    diff_reg <- ko_res$diffRegulation
+    diff_reg$knocked_gene <- gene  # 标记敲除的基因
+    diff_reg <- diff_reg[!(diff_reg$gene %in% target_genes), ]
+    all_diff_reg[[gene]] <- diff_reg
+  }, error = function(e) {
+    cat("Error processing", gene, ":", e$message, "\n")
+  })
+}
+
+combined_diff <- bind_rows(all_diff_reg)
+
+# 计算综合得分
+combined_summary <- combined_diff %>%
+  group_by(gene) %>%
+  summarise(
+    mean_FC = mean(FC, na.rm = TRUE),
+    max_FC = max(FC, na.rm = TRUE),
+    min_p_adj = min(p.adj, na.rm = TRUE),
+    combined_score = mean(abs(FC) * -log10(p.adj + 1e-10), na.rm = TRUE),
+    knockout_count = n()
+  ) %>%
+  arrange(desc(combined_score))
+# 保存结果
+write.csv(combined_diff, file = "scTenifoldKnk_Results/Combined_Knockout_Results.csv", row.names = FALSE)
+write.csv(combined_summary, file = "scTenifoldKnk_Results/Gene_Summary_Scores.csv", row.names = FALSE)
+
+###########################柱状图
+#绘制柱状图
+# ******** top20差异基因变量 ********
+top20_diff_genes <- head(combined_diff[order(-combined_diff$FC), ], 20)
+p1=ggplot(top20_diff_genes, aes(x=reorder(gene, FC), y=FC)) +
+  geom_bar(stat='identity', fill='#5A9BD4') +
+  coord_flip() + 
+  labs(title="Top 20 Differentially Regulated Genes", x="Gene", y="FC") +
+  theme_minimal() + theme(plot.title = element_text(hjust = 0.5))
+#输出图形
+pdf(file="barplot-F.pdf", width=6, height=5)
+print(p1)
+dev.off()
+combined_diff$log_p.adj <- -log10(combined_diff$p.adj)
+combined_diff$significant <- ifelse(combined_diff$p.adj < 0.05, "Significant", "Not significant")
+labeled_significant_genes <- subset(combined_diff, p.adj < 0.05)
+
+# 绘制火山图
+combined_diff$log_p.adj <- -log10(combined_diff$p.adj)
+combined_diff$group <- "Not significant"
+combined_diff$group[combined_diff$p.adj < 0.05 & combined_diff$Z > 1.96] <- "Up"
+combined_diff$group[combined_diff$p.adj < 0.05 & combined_diff$Z < -1.96] <- "Down"
+labeled_significant_genes <- combined_diff %>% 
+  filter(p.adj < 0.05) %>% 
+  arrange(desc(log_p.adj)) %>% 
+  head(10)
+p2 = ggplot(combined_diff, aes(x=Z, y=log_p.adj, color=group)) +
+  geom_point(alpha=0.6, size=1.2) + 
+  # 颜色设置：红色上调，蓝色下调，灰色不显著
+  scale_color_manual(values = c("Up" = "#E41A1C", "Down" = "#377EB8", "Not significant" = "gray80")) +
+  # 添加参考线
+  geom_vline(xintercept = c(-1.96, 1.96), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  # 标注基因名称
+  geom_text_repel(data = labeled_significant_genes, 
+                  aes(label = gene), 
+                  size = 3,
+                  box.padding = 0.5,     
+                  point.padding = 0.3,   
+                  max.overlaps = Inf,    
+                  show.legend = FALSE,
+                  segment.color = 'gray50') +
+  labs(title = "Volcano Plot: F Analysis", 
+       x = "Z-score (Differential Regulation)", 
+       y = "-log10(Adjusted P-value)") +
+  theme_classic() + 
+  theme(legend.position = "right") +
+  coord_cartesian(ylim = c(0, 50))
+ggsave("vol1-F.pdf", plot = p2, width = 6, height = 5)
+
+# 绘制饼图
+significant_gene_count <- table(combined_diff$significant)
+significant_gene_df <- as.data.frame(significant_gene_count)
+colnames(significant_gene_df) <- c("category", "count")
+significant_gene_df$percentage <- paste0(round(significant_gene_df$count / sum(significant_gene_df$count) * 100, 1), "%")
+p3 <- ggplot(significant_gene_df, aes(x="", y=count, fill=category)) +
+  geom_bar(stat="identity", width=1) +
+  geom_text(aes(label=percentage), position=position_stack(vjust=0.5), size=4) + 
+  coord_polar("y", start=0) + 
+  scale_fill_manual(values=c("Significant"="red", "Not significant"="lightgray")) + 
+  labs(title="Proportion of Significant Genes", fill="") +
+  theme_minimal() + 
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text = element_blank(),
+        panel.grid = element_blank(), legend.position = "right", plot.title = element_text(hjust = 0.5))
+# 输出饼图
+pdf(file="pie-F.pdf", width=6, height=5)
+print(p3)
+dev.off()
