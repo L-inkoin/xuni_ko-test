@@ -1,0 +1,554 @@
+install.packages("scTenifoldKnk")
+library(scTenifoldKnk)
+library(Seurat)
+library(hdf5r)
+library(ggplot2)
+library(dplyr)
+library(igraph)
+library(ggrepel)
+
+h5_files <- list.files(path = "data1", pattern = "\\.h5$", full.names = TRUE)
+sample_names <- gsub("_raw_feature_bc_matrix\\.h5$", "", basename(h5_files))
+sc_list <- list()
+for(i in seq_along(h5_files)){
+  data <- Read10X_h5(h5_files[i])
+  obj <- CreateSeuratObject(counts = data, 
+                            project = sample_names[i], 
+                            min.cells = 3, 
+                            min.features = 200)
+  sc_list[[i]] <- obj
+}
+
+# 合并数据
+pbmc <- merge(sc_list[[1]], y = sc_list[-1], add.cell.ids = sample_names)
+pbmc$Type <- ifelse(grepl("HT", pbmc$orig.ident), "Tumor", "Normal")
+
+seurat_obj <- subset(pbmc, subset = Type == "Tumor")
+seurat_obj <- JoinLayers(seurat_obj)
+####SPP1####
+target_gene_name <- "SPP1"
+#提取表达矩阵
+# ********表达矩阵变量 ********
+count_matrix <- GetAssayData(seurat_obj, layer = "counts")
+#提取高可变基因
+# ********高可变基因相关变量 ********
+seurat_obj <- FindVariableFeatures(object=seurat_obj, selection.method="vst", nfeatures=5000)
+high_variable_genes <- VariableFeatures(seurat_obj)
+# ********分析输入数据变量 ********
+input_data <- as.data.frame(count_matrix[unique(c(target_gene_name, high_variable_genes)),])
+
+#执行虚拟敲除
+# ********虚拟敲除结果变量 ********
+ko_analysis_result <- scTenifoldKnk(countMatrix = input_data,
+                                    gKO = target_gene_name,      #需要敲除的基因
+                                    qc = TRUE,                #是否进行QC
+                                    qc_mtThreshold = 0.1,        #mt的阈值
+                                    qc_minLSize = 1000,         #文库阈值(细胞测到的基因总数)
+                                    nc_nNet = 10,              #子网络数量
+                                    nc_nCells = 500            #每个网络中随机抽取的细胞数
+)
+
+#输出差异分析的结果
+# ********差异调控结果相关变量 ********
+diff_regulation_df <- ko_analysis_result$diffRegulation
+diff_regulation_df <- diff_regulation_df[diff_regulation_df$gene != target_gene_name, ]
+significant_diff_table <- diff_regulation_df[diff_regulation_df$p.adj<0.05,]
+write.table(significant_diff_table, file="sigDiff-SPP1.txt", sep="\t", quote=F, row.names=F)
+
+
+###########################柱状图
+#绘制柱状图
+# ******** top20差异基因变量 ********
+top20_diff_genes <- head(diff_regulation_df[order(-diff_regulation_df$FC), ], 20)
+p1=ggplot(top20_diff_genes, aes(x=reorder(gene, FC), y=FC)) +
+  geom_bar(stat='identity', fill='#5A9BD4') +
+  coord_flip() + 
+  labs(title="Top 20 Differentially Regulated Genes", x="Gene", y="FC") +
+  theme_minimal() + theme(plot.title = element_text(hjust = 0.5))
+#输出图形
+pdf(file="barplot-SPP1.pdf", width=6, height=5)
+print(p1)
+dev.off()
+
+diff_regulation_df$log_p.adj <- -log10(diff_regulation_df$p.adj)
+diff_regulation_df$significant <- ifelse(diff_regulation_df$p.adj < 0.05, "Significant", "Not significant")
+labeled_significant_genes <- subset(diff_regulation_df, p.adj < 0.05)
+
+# 绘制火山图
+
+diff_regulation_df$log_p.adj <- -log10(diff_regulation_df$p.adj)
+diff_regulation_df$group <- "Not significant"
+diff_regulation_df$group[diff_regulation_df$p.adj < 0.05 & diff_regulation_df$Z > 1.96] <- "Up"
+diff_regulation_df$group[diff_regulation_df$p.adj < 0.05 & diff_regulation_df$Z < -1.96] <- "Down"
+labeled_significant_genes <- diff_regulation_df %>% 
+  filter(p.adj < 0.05) %>% 
+  arrange(desc(log_p.adj)) %>% 
+  head(10)
+
+p2 = ggplot(diff_regulation_df, aes(x=Z, y=log_p.adj, color=group)) +
+  geom_point(alpha=0.6, size=1.2) + 
+  # 颜色设置：红色上调，蓝色下调，灰色不显著
+  scale_color_manual(values = c("Up" = "#E41A1C", "Down" = "#377EB8", "Not significant" = "gray80")) +
+  # 添加参考线
+  geom_vline(xintercept = c(-1.96, 1.96), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  # 标注基因名称
+  geom_text_repel(data = labeled_significant_genes, 
+                  aes(label = gene), 
+                  size = 3,
+                  box.padding = 0.5,     
+                  point.padding = 0.3,   
+                  max.overlaps = Inf,    
+                  show.legend = FALSE,
+                  segment.color = 'gray50') +
+  labs(title = "Volcano Plot: SPP1 Analysis", 
+       x = "Z-score (Differential Regulation)", 
+       y = "-log10(Adjusted P-value)") +
+  theme_classic() + 
+  theme(legend.position = "right") +
+  coord_cartesian(ylim = c(0, 50))
+ggsave("vol1-SPP1.pdf", plot = p2, width = 6, height = 5)
+
+significant_gene_count <- table(diff_regulation_df$significant)
+significant_gene_df <- as.data.frame(significant_gene_count)
+colnames(significant_gene_df) <- c("category", "count")
+significant_gene_df$percentage <- paste0(round(significant_gene_df$count / sum(significant_gene_df$count) * 100, 1), "%")
+# 绘制饼图
+p3 <- ggplot(significant_gene_df, aes(x="", y=count, fill=category)) +
+  geom_bar(stat="identity", width=1) +
+  geom_text(aes(label=percentage), position=position_stack(vjust=0.5), size=4) + 
+  coord_polar("y", start=0) + 
+  scale_fill_manual(values=c("Significant"="red", "Not significant"="lightgray")) + 
+  labs(title="Proportion of Significant Genes", fill="") +
+  theme_minimal() + 
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text = element_blank(),
+        panel.grid = element_blank(), legend.position = "right", plot.title = element_text(hjust = 0.5))
+# 输出饼图
+pdf(file="pie-SPP1.pdf", width=6, height=5)
+print(p3)
+dev.off()
+
+
+####AKR1C3####
+target_gene_name <- "AKR1C3"
+#提取表达矩阵
+# ********表达矩阵变量 ********
+count_matrix <- GetAssayData(seurat_obj, layer = "counts")
+#提取高可变基因
+# ********高可变基因相关变量 ********
+seurat_obj <- FindVariableFeatures(object=seurat_obj, selection.method="vst", nfeatures=5000)
+high_variable_genes <- VariableFeatures(seurat_obj)
+# ********分析输入数据变量 ********
+input_data <- as.data.frame(count_matrix[unique(c(target_gene_name, high_variable_genes)),])
+
+
+
+#执行虚拟敲除
+# ********虚拟敲除结果变量 ********
+ko_analysis_result <- scTenifoldKnk(countMatrix = input_data,
+                                    gKO = target_gene_name,      #需要敲除的基因
+                                    qc = TRUE,                #是否进行QC
+                                    qc_mtThreshold = 0.1,        #mt的阈值
+                                    qc_minLSize = 1000,         #文库阈值(细胞测到的基因总数)
+                                    nc_nNet = 10,              #子网络数量
+                                    nc_nCells = 500            #每个网络中随机抽取的细胞数
+)
+
+#输出差异分析的结果
+# ********差异调控结果相关变量 ********
+diff_regulation_df <- ko_analysis_result$diffRegulation
+diff_regulation_df <- diff_regulation_df[diff_regulation_df$gene != target_gene_name, ]
+significant_diff_table <- diff_regulation_df[diff_regulation_df$p.adj<0.05,]
+write.table(significant_diff_table, file="sigDiff-AKR1C3.txt", sep="\t", quote=F, row.names=F)
+
+
+###########################柱状图
+#绘制柱状图
+# ******** top20差异基因变量 ********
+top20_diff_genes <- head(diff_regulation_df[order(-diff_regulation_df$FC), ], 20)
+p1=ggplot(top20_diff_genes, aes(x=reorder(gene, FC), y=FC)) +
+  geom_bar(stat='identity', fill='#5A9BD4') +
+  coord_flip() + 
+  labs(title="Top 20 Differentially Regulated Genes", x="Gene", y="FC") +
+  theme_minimal() + theme(plot.title = element_text(hjust = 0.5))
+#输出图形
+pdf(file="barplot-AKR1C3.pdf", width=6, height=5)
+print(p1)
+dev.off()
+
+diff_regulation_df$log_p.adj <- -log10(diff_regulation_df$p.adj)
+diff_regulation_df$significant <- ifelse(diff_regulation_df$p.adj < 0.05, "Significant", "Not significant")
+labeled_significant_genes <- subset(diff_regulation_df, p.adj < 0.05)
+
+# 绘制火山图
+
+diff_regulation_df$log_p.adj <- -log10(diff_regulation_df$p.adj)
+diff_regulation_df$group <- "Not significant"
+diff_regulation_df$group[diff_regulation_df$p.adj < 0.05 & diff_regulation_df$Z > 1.96] <- "Up"
+diff_regulation_df$group[diff_regulation_df$p.adj < 0.05 & diff_regulation_df$Z < -1.96] <- "Down"
+labeled_significant_genes <- diff_regulation_df %>% 
+  filter(p.adj < 0.05) %>% 
+  arrange(desc(log_p.adj)) %>% 
+  head(10)
+
+p2 = ggplot(diff_regulation_df, aes(x=Z, y=log_p.adj, color=group)) +
+  geom_point(alpha=0.6, size=1.2) + 
+  # 颜色设置：红色上调，蓝色下调，灰色不显著
+  scale_color_manual(values = c("Up" = "#E41A1C", "Down" = "#377EB8", "Not significant" = "gray80")) +
+  # 添加参考线
+  geom_vline(xintercept = c(-1.96, 1.96), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  # 标注基因名称
+  geom_text_repel(data = labeled_significant_genes, 
+                  aes(label = gene), 
+                  size = 3,
+                  box.padding = 0.5,     
+                  point.padding = 0.3,   
+                  max.overlaps = Inf,    
+                  show.legend = FALSE,
+                  segment.color = 'gray50') +
+  labs(title = "Volcano Plot: AKR1C3 Analysis", 
+       x = "Z-score (Differential Regulation)", 
+       y = "-log10(Adjusted P-value)") +
+  theme_classic() + 
+  theme(legend.position = "right") +
+  coord_cartesian(ylim = c(0, 50))
+ggsave("vol1-AKR1C3.pdf", plot = p2, width = 6, height = 5)
+
+
+
+significant_gene_count <- table(diff_regulation_df$significant)
+significant_gene_df <- as.data.frame(significant_gene_count)
+colnames(significant_gene_df) <- c("category", "count")
+significant_gene_df$percentage <- paste0(round(significant_gene_df$count / sum(significant_gene_df$count) * 100, 1), "%")
+# 绘制饼图
+p3 <- ggplot(significant_gene_df, aes(x="", y=count, fill=category)) +
+  geom_bar(stat="identity", width=1) +
+  geom_text(aes(label=percentage), position=position_stack(vjust=0.5), size=4) + 
+  coord_polar("y", start=0) + 
+  scale_fill_manual(values=c("Significant"="red", "Not significant"="lightgray")) + 
+  labs(title="Proportion of Significant Genes", fill="") +
+  theme_minimal() + 
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text = element_blank(),
+        panel.grid = element_blank(), legend.position = "right", plot.title = element_text(hjust = 0.5))
+# 输出饼图
+pdf(file="pie-AKR1C31.pdf", width=6, height=5)
+print(p3)
+dev.off()
+
+####MMP9####
+target_gene_name <- "MMP9"
+#提取表达矩阵
+# ********表达矩阵变量 ********
+count_matrix <- GetAssayData(seurat_obj, layer = "counts")
+#提取高可变基因
+# ********高可变基因相关变量 ********
+seurat_obj <- FindVariableFeatures(object=seurat_obj, selection.method="vst", nfeatures=5000)
+high_variable_genes <- VariableFeatures(seurat_obj)
+# ********分析输入数据变量 ********
+input_data <- as.data.frame(count_matrix[unique(c(target_gene_name, high_variable_genes)),])
+
+
+
+#执行虚拟敲除
+# ********虚拟敲除结果变量 ********
+ko_analysis_result <- scTenifoldKnk(countMatrix = input_data,
+                                    gKO = target_gene_name,      #需要敲除的基因
+                                    qc = TRUE,                #是否进行QC
+                                    qc_mtThreshold = 0.1,        #mt的阈值
+                                    qc_minLSize = 1000,         #文库阈值(细胞测到的基因总数)
+                                    nc_nNet = 10,              #子网络数量
+                                    nc_nCells = 500            #每个网络中随机抽取的细胞数
+)
+
+#输出差异分析的结果
+# ********差异调控结果相关变量 ********
+diff_regulation_df <- ko_analysis_result$diffRegulation
+diff_regulation_df <- diff_regulation_df[diff_regulation_df$gene != target_gene_name, ]
+significant_diff_table <- diff_regulation_df[diff_regulation_df$p.adj<0.05,]
+write.table(significant_diff_table, file="sigDiff-MMP9.txt", sep="\t", quote=F, row.names=F)
+
+
+###########################柱状图
+#绘制柱状图
+# ******** top20差异基因变量 ********
+top20_diff_genes <- head(diff_regulation_df[order(-diff_regulation_df$FC), ], 20)
+p1=ggplot(top20_diff_genes, aes(x=reorder(gene, FC), y=FC)) +
+  geom_bar(stat='identity', fill='#5A9BD4') +
+  coord_flip() + 
+  labs(title="Top 20 Differentially Regulated Genes", x="Gene", y="FC") +
+  theme_minimal() + theme(plot.title = element_text(hjust = 0.5))
+#输出图形
+pdf(file="barplot-MMP9.pdf", width=6, height=5)
+print(p1)
+dev.off()
+
+diff_regulation_df$log_p.adj <- -log10(diff_regulation_df$p.adj)
+diff_regulation_df$significant <- ifelse(diff_regulation_df$p.adj < 0.05, "Significant", "Not significant")
+labeled_significant_genes <- subset(diff_regulation_df, p.adj < 0.05)
+
+# 绘制火山图
+
+diff_regulation_df$log_p.adj <- -log10(diff_regulation_df$p.adj)
+diff_regulation_df$group <- "Not significant"
+diff_regulation_df$group[diff_regulation_df$p.adj < 0.05 & diff_regulation_df$Z > 1.96] <- "Up"
+diff_regulation_df$group[diff_regulation_df$p.adj < 0.05 & diff_regulation_df$Z < -1.96] <- "Down"
+labeled_significant_genes <- diff_regulation_df %>% 
+  filter(p.adj < 0.05) %>% 
+  arrange(desc(log_p.adj)) %>% 
+  head(10)
+
+p2 = ggplot(diff_regulation_df, aes(x=Z, y=log_p.adj, color=group)) +
+  geom_point(alpha=0.6, size=1.2) + 
+  # 颜色设置：红色上调，蓝色下调，灰色不显著
+  scale_color_manual(values = c("Up" = "#E41A1C", "Down" = "#377EB8", "Not significant" = "gray80")) +
+  # 添加参考线
+  geom_vline(xintercept = c(-1.96, 1.96), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  # 标注基因名称
+  geom_text_repel(data = labeled_significant_genes, 
+                  aes(label = gene), 
+                  size = 3,
+                  box.padding = 0.5,     
+                  point.padding = 0.3,   
+                  max.overlaps = Inf,    
+                  show.legend = FALSE,
+                  segment.color = 'gray50') +
+  labs(title = "Volcano Plot: MMP9 Analysis", 
+       x = "Z-score (Differential Regulation)", 
+       y = "-log10(Adjusted P-value)") +
+  theme_classic() + 
+  theme(legend.position = "right") +
+  coord_cartesian(ylim = c(0, 50))
+ggsave("vol1-MMP9.pdf", plot = p2, width = 6, height = 5)
+
+
+significant_gene_count <- table(diff_regulation_df$significant)
+significant_gene_df <- as.data.frame(significant_gene_count)
+colnames(significant_gene_df) <- c("category", "count")
+significant_gene_df$percentage <- paste0(round(significant_gene_df$count / sum(significant_gene_df$count) * 100, 1), "%")
+# 绘制饼图
+p3 <- ggplot(significant_gene_df, aes(x="", y=count, fill=category)) +
+  geom_bar(stat="identity", width=1) +
+  geom_text(aes(label=percentage), position=position_stack(vjust=0.5), size=4) + 
+  coord_polar("y", start=0) + 
+  scale_fill_manual(values=c("Significant"="red", "Not significant"="lightgray")) + 
+  labs(title="Proportion of Significant Genes", fill="") +
+  theme_minimal() + 
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text = element_blank(),
+        panel.grid = element_blank(), legend.position = "right", plot.title = element_text(hjust = 0.5))
+# 输出饼图
+pdf(file="pie-MMP9.pdf", width=6, height=5)
+print(p3)
+dev.off()
+####CDK4####
+target_gene_name <- "CDK4"
+#提取表达矩阵
+# ********表达矩阵变量 ********
+count_matrix <- GetAssayData(seurat_obj, layer = "counts")
+#提取高可变基因
+# ********高可变基因相关变量 ********
+seurat_obj <- FindVariableFeatures(object=seurat_obj, selection.method="vst", nfeatures=5000)
+high_variable_genes <- VariableFeatures(seurat_obj)
+# ********分析输入数据变量 ********
+input_data <- as.data.frame(count_matrix[unique(c(target_gene_name, high_variable_genes)),])
+
+
+
+#执行虚拟敲除
+# ********虚拟敲除结果变量 ********
+ko_analysis_result <- scTenifoldKnk(countMatrix = input_data,
+                                    gKO = target_gene_name,      #需要敲除的基因
+                                    qc = TRUE,                #是否进行QC
+                                    qc_mtThreshold = 0.1,        #mt的阈值
+                                    qc_minLSize = 1000,         #文库阈值(细胞测到的基因总数)
+                                    nc_nNet = 10,              #子网络数量
+                                    nc_nCells = 500            #每个网络中随机抽取的细胞数
+)
+
+#输出差异分析的结果
+# ********差异调控结果相关变量 ********
+diff_regulation_df <- ko_analysis_result$diffRegulation
+diff_regulation_df <- diff_regulation_df[diff_regulation_df$gene != target_gene_name, ]
+significant_diff_table <- diff_regulation_df[diff_regulation_df$p.adj<0.05,]
+write.table(significant_diff_table, file="sigDiff-CDK4.txt", sep="\t", quote=F, row.names=F)
+
+
+###########################柱状图
+#绘制柱状图
+# ******** top20差异基因变量 ********
+top20_diff_genes <- head(diff_regulation_df[order(-diff_regulation_df$FC), ], 20)
+p1=ggplot(top20_diff_genes, aes(x=reorder(gene, FC), y=FC)) +
+  geom_bar(stat='identity', fill='#5A9BD4') +
+  coord_flip() + 
+  labs(title="Top 20 Differentially Regulated Genes", x="Gene", y="FC") +
+  theme_minimal() + theme(plot.title = element_text(hjust = 0.5))
+#输出图形
+pdf(file="barplot-CDK4.pdf", width=6, height=5)
+print(p1)
+dev.off()
+
+diff_regulation_df$log_p.adj <- -log10(diff_regulation_df$p.adj)
+diff_regulation_df$significant <- ifelse(diff_regulation_df$p.adj < 0.05, "Significant", "Not significant")
+labeled_significant_genes <- subset(diff_regulation_df, p.adj < 0.05)
+
+# 绘制火山图
+
+diff_regulation_df$log_p.adj <- -log10(diff_regulation_df$p.adj)
+diff_regulation_df$group <- "Not significant"
+diff_regulation_df$group[diff_regulation_df$p.adj < 0.05 & diff_regulation_df$Z > 1.96] <- "Up"
+diff_regulation_df$group[diff_regulation_df$p.adj < 0.05 & diff_regulation_df$Z < -1.96] <- "Down"
+labeled_significant_genes <- diff_regulation_df %>% 
+  filter(p.adj < 0.05) %>% 
+  arrange(desc(log_p.adj)) %>% 
+  head(10)
+
+p2 = ggplot(diff_regulation_df, aes(x=Z, y=log_p.adj, color=group)) +
+  geom_point(alpha=0.6, size=1.2) + 
+  # 颜色设置：红色上调，蓝色下调，灰色不显著
+  scale_color_manual(values = c("Up" = "#E41A1C", "Down" = "#377EB8", "Not significant" = "gray80")) +
+  # 添加参考线
+  geom_vline(xintercept = c(-1.96, 1.96), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  # 标注基因名称
+  geom_text_repel(data = labeled_significant_genes, 
+                  aes(label = gene), 
+                  size = 3,
+                  box.padding = 0.5,     
+                  point.padding = 0.3,   
+                  max.overlaps = Inf,    
+                  show.legend = FALSE,
+                  segment.color = 'gray50') +
+  labs(title = "Volcano Plot: CDK4 Analysis", 
+       x = "Z-score (Differential Regulation)", 
+       y = "-log10(Adjusted P-value)") +
+  theme_classic() + 
+  theme(legend.position = "right") +
+  coord_cartesian(ylim = c(0, 50))
+ggsave("vol1-CDK4.pdf", plot = p2, width = 6, height = 5)
+
+
+significant_gene_count <- table(diff_regulation_df$significant)
+significant_gene_df <- as.data.frame(significant_gene_count)
+colnames(significant_gene_df) <- c("category", "count")
+significant_gene_df$percentage <- paste0(round(significant_gene_df$count / sum(significant_gene_df$count) * 100, 1), "%")
+# 绘制饼图
+p3 <- ggplot(significant_gene_df, aes(x="", y=count, fill=category)) +
+  geom_bar(stat="identity", width=1) +
+  geom_text(aes(label=percentage), position=position_stack(vjust=0.5), size=4) + 
+  coord_polar("y", start=0) + 
+  scale_fill_manual(values=c("Significant"="red", "Not significant"="lightgray")) + 
+  labs(title="Proportion of Significant Genes", fill="") +
+  theme_minimal() + 
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text = element_blank(),
+        panel.grid = element_blank(), legend.position = "right", plot.title = element_text(hjust = 0.5))
+# 输出饼图
+pdf(file="pie-CDK4.pdf", width=6, height=5)
+print(p3)
+dev.off()
+
+####LGALS1####
+target_gene_name <- "LGALS1"
+#提取表达矩阵
+# ********表达矩阵变量 ********
+count_matrix <- GetAssayData(seurat_obj, layer = "counts")
+#提取高可变基因
+# ********高可变基因相关变量 ********
+seurat_obj <- FindVariableFeatures(object=seurat_obj, selection.method="vst", nfeatures=5000)
+high_variable_genes <- VariableFeatures(seurat_obj)
+# ********分析输入数据变量 ********
+input_data <- as.data.frame(count_matrix[unique(c(target_gene_name, high_variable_genes)),])
+
+
+
+#执行虚拟敲除
+# ********虚拟敲除结果变量 ********
+ko_analysis_result <- scTenifoldKnk(countMatrix = input_data,
+                                    gKO = target_gene_name,      #需要敲除的基因
+                                    qc = TRUE,                #是否进行QC
+                                    qc_mtThreshold = 0.1,        #mt的阈值
+                                    qc_minLSize = 1000,         #文库阈值(细胞测到的基因总数)
+                                    nc_nNet = 10,              #子网络数量
+                                    nc_nCells = 500            #每个网络中随机抽取的细胞数
+)
+
+#输出差异分析的结果
+# ********差异调控结果相关变量 ********
+diff_regulation_df <- ko_analysis_result$diffRegulation
+diff_regulation_df <- diff_regulation_df[diff_regulation_df$gene != target_gene_name, ]
+significant_diff_table <- diff_regulation_df[diff_regulation_df$p.adj<0.05,]
+write.table(significant_diff_table, file="sigDiff-LGALS1.txt", sep="\t", quote=F, row.names=F)
+
+
+###########################柱状图
+#绘制柱状图
+# ******** top20差异基因变量 ********
+top20_diff_genes <- head(diff_regulation_df[order(-diff_regulation_df$FC), ], 20)
+p1=ggplot(top20_diff_genes, aes(x=reorder(gene, FC), y=FC)) +
+  geom_bar(stat='identity', fill='#5A9BD4') +
+  coord_flip() + 
+  labs(title="Top 20 Differentially Regulated Genes", x="Gene", y="FC") +
+  theme_minimal() + theme(plot.title = element_text(hjust = 0.5))
+#输出图形
+pdf(file="barplot-LGALS1.pdf", width=6, height=5)
+print(p1)
+dev.off()
+
+diff_regulation_df$log_p.adj <- -log10(diff_regulation_df$p.adj)
+diff_regulation_df$significant <- ifelse(diff_regulation_df$p.adj < 0.05, "Significant", "Not significant")
+labeled_significant_genes <- subset(diff_regulation_df, p.adj < 0.05)
+
+# 绘制火山图
+
+diff_regulation_df$log_p.adj <- -log10(diff_regulation_df$p.adj)
+diff_regulation_df$group <- "Not significant"
+diff_regulation_df$group[diff_regulation_df$p.adj < 0.05 & diff_regulation_df$Z > 1.96] <- "Up"
+diff_regulation_df$group[diff_regulation_df$p.adj < 0.05 & diff_regulation_df$Z < -1.96] <- "Down"
+labeled_significant_genes <- diff_regulation_df %>% 
+  filter(p.adj < 0.05) %>% 
+  arrange(desc(log_p.adj)) %>% 
+  head(10)
+
+p2 = ggplot(diff_regulation_df, aes(x=Z, y=log_p.adj, color=group)) +
+  geom_point(alpha=0.6, size=1.2) + 
+  # 颜色设置：红色上调，蓝色下调，灰色不显著
+  scale_color_manual(values = c("Up" = "#E41A1C", "Down" = "#377EB8", "Not significant" = "gray80")) +
+  # 添加参考线
+  geom_vline(xintercept = c(-1.96, 1.96), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+  # 标注基因名称
+  geom_text_repel(data = labeled_significant_genes, 
+                  aes(label = gene), 
+                  size = 3,
+                  box.padding = 0.5,     
+                  point.padding = 0.3,   
+                  max.overlaps = Inf,    
+                  show.legend = FALSE,
+                  segment.color = 'gray50') +
+  labs(title = "Volcano Plot: LGALS13 Analysis", 
+       x = "Z-score (Differential Regulation)", 
+       y = "-log10(Adjusted P-value)") +
+  theme_classic() + 
+  theme(legend.position = "right") +
+  coord_cartesian(ylim = c(0, 50))
+ggsave("vol1-LGALS1.pdf", plot = p2, width = 6, height = 5)
+
+
+significant_gene_count <- table(diff_regulation_df$significant)
+significant_gene_df <- as.data.frame(significant_gene_count)
+colnames(significant_gene_df) <- c("category", "count")
+significant_gene_df$percentage <- paste0(round(significant_gene_df$count / sum(significant_gene_df$count) * 100, 1), "%")
+# 绘制饼图
+p3 <- ggplot(significant_gene_df, aes(x="", y=count, fill=category)) +
+  geom_bar(stat="identity", width=1) +
+  geom_text(aes(label=percentage), position=position_stack(vjust=0.5), size=4) + 
+  coord_polar("y", start=0) + 
+  scale_fill_manual(values=c("Significant"="red", "Not significant"="lightgray")) + 
+  labs(title="Proportion of Significant Genes", fill="") +
+  theme_minimal() + 
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text = element_blank(),
+        panel.grid = element_blank(), legend.position = "right", plot.title = element_text(hjust = 0.5))
+# 输出饼图
+pdf(file="pie-LGALS1.pdf", width=6, height=5)
+print(p3)
+dev.off()
